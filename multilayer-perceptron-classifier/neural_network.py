@@ -1,6 +1,6 @@
-from typing import List
+from typing import List, Literal
 import numpy as np
-from utils import onehot_encode, add_bias, compute_accuracy
+from utils import add_bias
 
 class ActivationFunction:
     
@@ -39,18 +39,25 @@ class Layer:
         a = self.afunc(z)
         return a, z
 
-        
 class NeuralNetwork:
 
-    def __init__(self, layers: List[Layer]):
-        self.layers = layers
-        for i, l in enumerate(self.layers):
-            if i == 0:
-                l.W = np.random.randn(l.num_neurons, l.input_dim + 1)  # input layer + bias
-            else:
-                l.W = np.random.randn(l.num_neurons, self.layers[i-1].num_neurons + 1)
     
-    def forward(self, x, save:bool):
+    def __init__(self, layers: List[Layer], weights_init: Literal['he-uniform', 'he-normal'] = 'he-uniform'):
+        self.layers = layers
+        for i, layer in enumerate(self.layers):
+            fan_in = layer.input_dim if i == 0 else self.layers[i - 1].num_neurons
+            fan_out = layer.num_neurons
+
+            if weights_init == 'he-uniform':
+                limit = np.sqrt(6 / (fan_in + fan_out))
+                W = np.random.uniform(-limit, limit, size=(fan_out, fan_in))
+            else:
+                std = np.sqrt(2 / (fan_in + fan_out))
+                W = np.random.normal(loc=0.0, scale=std, size=(fan_out, fan_in))
+
+            layer.W = np.hstack([W, np.zeros((fan_out, 1))])
+    
+    def _forward(self, x, save:bool):
         al = x
         for l in self.layers:
             al, zl = l.forward(al)
@@ -59,68 +66,62 @@ class NeuralNetwork:
                 l.z = zl
         return al, zl
     
-    def loss(self, y_true, y_pred):
-        # print(f"loss pred shape is {pred.shape}") 
-        # print(f"loss target shape is {target.shape}")
-
-        # print(f"loss pred {pred[:20]}")
-        # print(f"loss target {target[:20]}")
-
+    def _loss(self, y_true, y_pred):
         y_pred = np.clip(y_pred, 1e-10, None) # prevent issues with log(0)
-
         return -np.sum(y_true * np.log(y_pred)) 
 
     
-    def train(self, X_train, y_train, lr: float, epochs:int, X_val=None, y_val=None):
-        print(f"Training with {X_train.shape[0]} samples, {X_train.shape[1]} features, {y_train.shape[0]} classes")
-        print(f"Validation with {X_val.shape[0]} samples, {X_val.shape[1]} features, {y_val.shape[0]} classes") 
+    def train(self, X_train, y_train, lr: float, epochs: int, batch_size: int = 32, X_val=None, y_val=None, verbose=False):
         m = X_train.shape[1]
         train_losses = []
         val_losses = []
         for ep in range(epochs):
-            pred_train, zl = self.forward(X_train, True)
-
-            loss_train = self.loss(y_train, pred_train)/m
-            train_losses.append(loss_train)
-            print(f"Epoch {ep} Loss: {loss_train:.6f}")
+            perm = np.random.permutation(m)
+            total_train_loss = 0
+        
+            for i in range(0, m, batch_size):
+                indices = perm[i:i + batch_size]
+                X_batch = X_train[:, indices]
+                y_batch = y_train[:, indices]
+                batch_size_current = X_batch.shape[1]
+                
+                pred_batch, zl = self._forward(X_batch, True)
+                mini_batch_loss = self._loss(y_batch, pred_batch)
+                total_train_loss += mini_batch_loss
+        
+                dz = pred_batch - y_batch
+                for j in range(len(self.layers) - 1, -1, -1):
+                    layer = self.layers[j]
+                    if j == 0:
+                        previous_a = X_batch
+                    else:
+                        previous_a = self.layers[j - 1].a
+                    dW_sum = dz @ add_bias(previous_a).T
+                    dW = dW_sum / batch_size_current
+                    layer.W -= lr * dW
+                    if j > 0:
+                        dz = (layer.W.T @ dz)[:-1, :] * ActivationFunction.d_relu(self.layers[j - 1].z)
+            
+            average_train_loss = total_train_loss / m
+            train_losses.append(average_train_loss)
+            
             if X_val is not None and y_val is not None:
-                pred_val, zl = self.forward(X_val, save=False)
-                val_loss = self.loss(y_val, pred_val)/X_val.shape[1]
+                pred_val, zl = self._forward(X_val, False)
+                val_loss = self._loss(y_val, pred_val) / X_val.shape[1]
                 val_losses.append(val_loss)
-
-            dz2 = pred_train - y_train
-            dW2 = dz2 @ add_bias(self.layers[1].a).T / m 
-
-            da1 = self.layers[2].W.T @ dz2
-            dz1 = da1[:-1, :] * ActivationFunction.d_relu(self.layers[1].z)  
-            dW1 = dz1 @ add_bias(self.layers[0].a).T / m
-
-            da0 = self.layers[1].W.T @ dz1
-            dz0 = da0[:-1, :] * ActivationFunction.d_relu(self.layers[0].z)
-            dW0 = dz0 @ add_bias(X_train).T / m
-
-            self.layers[2].W -= lr * dW2
-            self.layers[1].W -= lr * dW1
-            self.layers[0].W -= lr * dW0
+            
+            if verbose:
+                print(f"Epoch {ep} Loss: {average_train_loss:.6f}", end="")
+                if X_val is not None and y_val is not None:
+                    print(f" Val Loss: {val_loss:.6f}")
+                else:
+                    print()
         
         return train_losses, val_losses
 
-
     def predict(self, x):
-        # print(f"predict x shape is {x.shape}")
-        a, z = self.forward(x, save=False)
-        # print(f"predict pred shape is {a.shape}")
-        # print(f"predict pred samples are {a.T[10:20]}")
-
+        a, z = self._forward(x, save=False)
         predicted_class = np.argmax(a, axis=0)
-        # print(f"predict predicted class shape {predicted_class.shape}")
-        # print(f"predict predicted class data {predicted_class}")
-
         one_hot = np.zeros_like(a)
         one_hot[predicted_class, np.arange(a.shape[1])] = 1
-
-
         return one_hot
-
-if __name__ == "__main__":
-    pass
